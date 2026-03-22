@@ -145,7 +145,30 @@ class DimOverlay(QWidget):
 
     def ensure_topmost(self):
         if self._always_on_top:
-            self.set_always_on_top(True)
+            if sys.platform == "win32":
+                try:
+                    from ctypes import windll
+
+                    hwnd = int(self.winId())
+                    HWND_TOPMOST = -1
+                    SWP_NOSIZE = 0x0001
+                    SWP_NOMOVE = 0x0002
+                    SWP_NOACTIVATE = 0x0010
+                    SWP_SHOWWINDOW = 0x0040
+                    windll.user32.SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
+                except Exception:
+                    pass
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            self.show()
+            self.raise_()
 
     def set_always_on_top(self, enabled: bool):
         self._always_on_top = bool(enabled)
@@ -292,6 +315,12 @@ class BrightGUI(QWidget):
         self.timer.timeout.connect(self.tick_auto)
         self.timer.start()
 
+        # Keep overlays pinned above other top-most windows without stealing focus.
+        self.topmost_watchdog = QTimer(self)
+        self.topmost_watchdog.setInterval(1200)
+        self.topmost_watchdog.timeout.connect(self.topmost_tick)
+        self.topmost_watchdog.start()
+
         self.tick_auto(force=True)
         self.toggle_always_on_top(self.chk_topmost.isChecked())
 
@@ -361,6 +390,14 @@ class BrightGUI(QWidget):
     def toggle_always_on_top(self, enabled: bool):
         for d in self.dimmers:
             d.set_always_on_top(enabled)
+        if enabled:
+            self.topmost_tick()
+
+    def topmost_tick(self):
+        if not self.chk_topmost.isChecked():
+            return
+        for d in self.dimmers:
+            d.ensure_topmost()
 
     def tick_auto(self, force: bool = False):
         if self.manual_override and not force:
