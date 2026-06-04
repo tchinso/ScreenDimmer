@@ -9,6 +9,8 @@
 #include <string.h>
 #include <wchar.h>
 
+#include "resource.h"
+
 #define CFG_NAME "brightness.cfg"
 #define MAX_MONITORS 16
 #define MAX_RULES 128
@@ -67,6 +69,7 @@ static BOOL g_controls_ready;
 static BOOL g_updating_controls;
 static BOOL g_tray_added;
 static UINT g_taskbar_created_msg;
+static HICON g_app_icon;
 
 typedef BOOL (WINAPI *PFN_SET_LAYERED_WINDOW_ATTRIBUTES)(HWND, COLORREF, BYTE, DWORD);
 typedef BOOL (WINAPI *PFN_SET_PROCESS_DPI_AWARE)(void);
@@ -619,7 +622,7 @@ static void add_tray_icon(HWND hwnd)
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = (HICON)LoadIconW(NULL, IDI_APPLICATION);
+    nid.hIcon = g_app_icon ? g_app_icon : (HICON)LoadIconW(NULL, IDI_APPLICATION);
     lstrcpynW(nid.szTip, utf8_wide("화면 필터 밝기"), sizeof(nid.szTip) / sizeof(nid.szTip[0]));
 
     if (Shell_NotifyIconW(NIM_ADD, &nid)) {
@@ -844,7 +847,7 @@ static BOOL register_classes(void)
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = main_proc;
     wc.hInstance = g_inst;
-    wc.hIcon = (HICON)LoadIconW(NULL, IDI_APPLICATION);
+    wc.hIcon = g_app_icon ? g_app_icon : (HICON)LoadIconW(NULL, IDI_APPLICATION);
     wc.hCursor = (HCURSOR)LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"ScreenDimmerMain";
@@ -893,6 +896,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
     g_inst = inst;
     load_optional_apis();
     make_process_dpi_aware();
+    g_app_icon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_SCREENDIMMER),
+                                   IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
 
     g_black_brush = CreateSolidBrush(RGB(0, 0, 0));
     g_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
