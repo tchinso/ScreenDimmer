@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
+#include <dbt.h>
 #include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,8 +28,24 @@
 
 #define TIMER_AUTO 1
 #define TIMER_TOPMOST 2
+#define TIMER_DISPLAY_REFRESH 3
 
 #define WM_TRAYICON (WM_APP + 1)
+
+#define SINGLE_INSTANCE_MUTEX_NAME L"Local\\ScreenDimmer.SingleInstance"
+#define SHOW_EXISTING_MESSAGE_NAME L"ScreenDimmer.ShowExisting"
+
+#ifndef WDA_MONITOR
+#define WDA_MONITOR 0x00000001
+#endif
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
 
 typedef struct {
     int start_minutes;
@@ -43,6 +60,13 @@ typedef struct {
     int brightness;
     BOOL blackout;
 } MonitorDimmer;
+
+typedef struct {
+    HMONITOR handle;
+    RECT rect;
+    int brightness;
+    BOOL blackout;
+} MonitorState;
 
 static HINSTANCE g_inst;
 static HWND g_main;
@@ -68,26 +92,47 @@ static BOOL g_manual_override;
 static BOOL g_controls_ready;
 static BOOL g_updating_controls;
 static BOOL g_tray_added;
+static BOOL g_topmost_enabled = TRUE;
 static UINT g_taskbar_created_msg;
+static UINT g_show_existing_msg;
 static HICON g_app_icon;
+static HANDLE g_single_instance_mutex;
 
 typedef BOOL (WINAPI *PFN_SET_LAYERED_WINDOW_ATTRIBUTES)(HWND, COLORREF, BYTE, DWORD);
 typedef BOOL (WINAPI *PFN_SET_PROCESS_DPI_AWARE)(void);
+typedef BOOL (WINAPI *PFN_SET_WINDOW_DISPLAY_AFFINITY)(HWND, DWORD);
 
 static PFN_SET_LAYERED_WINDOW_ATTRIBUTES g_set_layered_window_attributes;
 static PFN_SET_PROCESS_DPI_AWARE g_set_process_dpi_aware;
+static PFN_SET_WINDOW_DISPLAY_AFFINITY g_set_window_display_affinity;
 
 static void load_optional_apis(void)
 {
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    union {
+        FARPROC proc;
+        PFN_SET_LAYERED_WINDOW_ATTRIBUTES fn;
+    } layered_window_attributes;
+    union {
+        FARPROC proc;
+        PFN_SET_PROCESS_DPI_AWARE fn;
+    } process_dpi_aware;
+    union {
+        FARPROC proc;
+        PFN_SET_WINDOW_DISPLAY_AFFINITY fn;
+    } window_display_affinity;
+
     if (!user32) {
         return;
     }
 
-    g_set_layered_window_attributes =
-        (PFN_SET_LAYERED_WINDOW_ATTRIBUTES)GetProcAddress(user32, "SetLayeredWindowAttributes");
-    g_set_process_dpi_aware =
-        (PFN_SET_PROCESS_DPI_AWARE)GetProcAddress(user32, "SetProcessDPIAware");
+    layered_window_attributes.proc = GetProcAddress(user32, "SetLayeredWindowAttributes");
+    process_dpi_aware.proc = GetProcAddress(user32, "SetProcessDPIAware");
+    window_display_affinity.proc = GetProcAddress(user32, "SetWindowDisplayAffinity");
+
+    g_set_layered_window_attributes = layered_window_attributes.fn;
+    g_set_process_dpi_aware = process_dpi_aware.fn;
+    g_set_window_display_affinity = window_display_affinity.fn;
 }
 
 static void make_process_dpi_aware(void)
@@ -101,6 +146,17 @@ static void set_overlay_alpha(HWND hwnd, BYTE alpha)
 {
     if (g_set_layered_window_attributes) {
         g_set_layered_window_attributes(hwnd, 0, alpha, LWA_ALPHA);
+    }
+}
+
+static void hide_overlay_from_capture(HWND hwnd)
+{
+    if (!g_set_window_display_affinity || !hwnd) {
+        return;
+    }
+
+    if (!g_set_window_display_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
+        g_set_window_display_affinity(hwnd, WDA_MONITOR);
     }
 }
 
@@ -486,6 +542,7 @@ static BOOL CALLBACK enum_monitor_proc(HMONITOR monitor, HDC hdc, LPRECT rect, L
     dimmer->overlay = overlay;
     set_overlay_alpha(overlay, 0);
     ShowWindow(overlay, SW_SHOWNOACTIVATE);
+    hide_overlay_from_capture(overlay);
 
     g_monitor_count++;
     return TRUE;
@@ -495,6 +552,91 @@ static void create_overlays(void)
 {
     g_monitor_count = 0;
     EnumDisplayMonitors(NULL, NULL, enum_monitor_proc, 0);
+}
+
+static BOOL same_rect(const RECT *a, const RECT *b)
+{
+    return a->left == b->left &&
+           a->top == b->top &&
+           a->right == b->right &&
+           a->bottom == b->bottom;
+}
+
+static void snapshot_monitor_states(MonitorState states[MAX_MONITORS], int *count)
+{
+    int i;
+
+    *count = g_monitor_count;
+    for (i = 0; i < g_monitor_count && i < MAX_MONITORS; i++) {
+        states[i].handle = g_monitors[i].handle;
+        states[i].rect = g_monitors[i].rect;
+        states[i].brightness = g_monitors[i].brightness;
+        states[i].blackout = g_monitors[i].blackout;
+    }
+}
+
+static int find_monitor_state(MonitorState states[MAX_MONITORS], BOOL used[MAX_MONITORS],
+                              int count, int preferred_index, HMONITOR handle, const RECT *rect)
+{
+    int i;
+
+    for (i = 0; i < count; i++) {
+        if (!used[i] && states[i].handle == handle) {
+            return i;
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        if (!used[i] && same_rect(&states[i].rect, rect)) {
+            return i;
+        }
+    }
+
+    if (preferred_index >= 0 && preferred_index < count && !used[preferred_index]) {
+        return preferred_index;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (!used[i]) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static void restore_monitor_states(MonitorState states[MAX_MONITORS], int count)
+{
+    BOOL used[MAX_MONITORS];
+    BOOL any_visible;
+    int i;
+
+    ZeroMemory(used, sizeof(used));
+    for (i = 0; i < g_monitor_count; i++) {
+        int match = find_monitor_state(states, used, count, i,
+                                       g_monitors[i].handle, &g_monitors[i].rect);
+        if (match >= 0) {
+            used[match] = TRUE;
+            g_monitors[i].brightness = states[match].brightness;
+            g_monitors[i].blackout = states[match].blackout;
+        }
+    }
+
+    any_visible = FALSE;
+    for (i = 0; i < g_monitor_count; i++) {
+        if (!g_monitors[i].blackout) {
+            any_visible = TRUE;
+            break;
+        }
+    }
+
+    if (!any_visible && g_monitor_count > 0) {
+        g_monitors[0].blackout = FALSE;
+    }
+
+    for (i = 0; i < g_monitor_count; i++) {
+        update_overlay_alpha(i);
+    }
 }
 
 static void create_main_controls(HWND hwnd)
@@ -514,7 +656,7 @@ static void create_main_controls(HWND hwnd)
 
     g_topmost_check = create_control(hwnd, L"BUTTON", "필터를 항상 최상위로 설정",
                                      BS_AUTOCHECKBOX, ID_TOPMOST, 16, 126, 260, 24, g_font);
-    SendMessageW(g_topmost_check, BM_SETCHECK, BST_CHECKED, 0);
+    SendMessageW(g_topmost_check, BM_SETCHECK, g_topmost_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
 
     create_control(hwnd, L"STATIC", "", SS_ETCHEDHORZ,
                    0, 16, 158, 508, 2, g_font);
@@ -544,13 +686,16 @@ static void create_main_controls(HWND hwnd)
         SendMessageW(g_sliders[i], TBM_SETRANGE, TRUE, MAKELPARAM(5, 100));
         SendMessageW(g_sliders[i], TBM_SETTICFREQ, 5, 0);
         SendMessageW(g_sliders[i], TBM_SETPAGESIZE, 0, 5);
-        SendMessageW(g_sliders[i], TBM_SETPOS, TRUE, 100);
+        SendMessageW(g_sliders[i], TBM_SETPOS, TRUE, g_monitors[i].brightness);
 
         g_value_labels[i] = create_control(hwnd, L"STATIC", "100%", SS_RIGHT,
                                            ID_VALUE_BASE + i, 380, y + 4, 52, 24, g_font);
         g_blackout_checks[i] = create_control(hwnd, L"BUTTON", "100% 어둡기",
                                               BS_AUTOCHECKBOX, ID_BLACKOUT_BASE + i,
                                               444, y + 2, 96, 24, g_font);
+        SendMessageW(g_blackout_checks[i], BM_SETCHECK,
+                     g_monitors[i].blackout ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(g_sliders[i], !g_monitors[i].blackout);
         y += 40;
     }
 
@@ -560,16 +705,18 @@ static void create_main_controls(HWND hwnd)
                    ID_AUTO, 279, y + 12, 245, 34, g_font);
 
     g_controls_ready = TRUE;
+    for (i = 0; i < g_monitor_count; i++) {
+        update_value_label(i);
+    }
     refresh_status();
 }
 
 static void bring_overlays_to_front(void)
 {
     int i;
-    BOOL topmost = SendMessageW(g_topmost_check, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
     for (i = 0; i < g_monitor_count; i++) {
-        if (topmost) {
+        if (g_topmost_enabled) {
             ensure_overlay_topmost(i);
         } else {
             set_overlay_topmost(i, FALSE);
@@ -593,8 +740,7 @@ static void topmost_watchdog(void)
 {
     int i;
 
-    if (!g_controls_ready ||
-        SendMessageW(g_topmost_check, BM_GETCHECK, 0, 0) != BST_CHECKED) {
+    if (!g_controls_ready || !g_topmost_enabled) {
         return;
     }
 
@@ -646,6 +792,68 @@ static void remove_tray_icon(HWND hwnd)
     g_tray_added = FALSE;
 }
 
+static void position_window_on_cursor_monitor(HWND hwnd)
+{
+    MONITORINFO info;
+    HMONITOR monitor;
+    POINT pt;
+    RECT rect;
+    int width;
+    int height;
+    int work_width;
+    int work_height;
+    int x;
+    int y;
+
+    if (!GetCursorPos(&pt) || !GetWindowRect(hwnd, &rect)) {
+        return;
+    }
+
+    monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) {
+        return;
+    }
+
+    width = rect.right - rect.left;
+    height = rect.bottom - rect.top;
+    work_width = info.rcWork.right - info.rcWork.left;
+    work_height = info.rcWork.bottom - info.rcWork.top;
+
+    x = info.rcWork.left + (work_width - width) / 2;
+    y = info.rcWork.top + (work_height - height) / 2;
+
+    if (width >= work_width) {
+        x = info.rcWork.left;
+    } else {
+        x = clamp_int(x, info.rcWork.left, info.rcWork.right - width);
+    }
+
+    if (height >= work_height) {
+        y = info.rcWork.top;
+    } else {
+        y = clamp_int(y, info.rcWork.top, info.rcWork.bottom - height);
+    }
+
+    SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void show_main_on_cursor_monitor(HWND hwnd)
+{
+    remove_tray_icon(hwnd);
+
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    } else {
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+    }
+
+    position_window_on_cursor_monitor(hwnd);
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+}
+
 static void hide_to_tray(HWND hwnd)
 {
     add_tray_icon(hwnd);
@@ -654,9 +862,7 @@ static void hide_to_tray(HWND hwnd)
 
 static void show_from_tray(HWND hwnd)
 {
-    ShowWindow(hwnd, SW_SHOWNORMAL);
-    SetForegroundWindow(hwnd);
-    remove_tray_icon(hwnd);
+    show_main_on_cursor_monitor(hwnd);
 }
 
 static void show_tray_menu(HWND hwnd)
@@ -681,6 +887,7 @@ static void handle_command(HWND hwnd, int id)
 {
     if (id == ID_TOPMOST) {
         BOOL enabled = SendMessageW(g_topmost_check, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        g_topmost_enabled = enabled;
         set_all_overlays_topmost(enabled);
         if (enabled) {
             topmost_watchdog();
@@ -749,6 +956,52 @@ static void handle_scroll(HWND control)
     }
 }
 
+static void destroy_child_controls(HWND parent)
+{
+    HWND child;
+
+    g_controls_ready = FALSE;
+    g_updating_controls = TRUE;
+
+    child = GetWindow(parent, GW_CHILD);
+    while (child) {
+        HWND next = GetWindow(child, GW_HWNDNEXT);
+        DestroyWindow(child);
+        child = next;
+    }
+
+    ZeroMemory(g_sliders, sizeof(g_sliders));
+    ZeroMemory(g_value_labels, sizeof(g_value_labels));
+    ZeroMemory(g_blackout_checks, sizeof(g_blackout_checks));
+    g_mode_label = NULL;
+    g_cfg_label = NULL;
+    g_topmost_check = NULL;
+    g_updating_controls = FALSE;
+}
+
+static void resize_main_window(HWND hwnd)
+{
+    RECT rect;
+    DWORD style;
+    DWORD ex_style;
+    int client_w;
+    int client_h;
+
+    style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
+    ex_style = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    client_w = 548;
+    client_h = 250 + g_monitor_count * 40;
+
+    rect.left = 0;
+    rect.top = 0;
+    rect.right = client_w;
+    rect.bottom = client_h;
+    AdjustWindowRectEx(&rect, style, FALSE, ex_style);
+
+    SetWindowPos(hwnd, NULL, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 static void destroy_overlays(void)
 {
     int i;
@@ -760,8 +1013,83 @@ static void destroy_overlays(void)
     }
 }
 
+static void refresh_display_layout(HWND hwnd)
+{
+    MonitorState states[MAX_MONITORS];
+    int state_count;
+    BOOL was_visible;
+
+    snapshot_monitor_states(states, &state_count);
+    was_visible = IsWindowVisible(hwnd);
+
+    destroy_overlays();
+    create_overlays();
+    restore_monitor_states(states, state_count);
+
+    destroy_child_controls(hwnd);
+    resize_main_window(hwnd);
+    create_main_controls(hwnd);
+
+    if (!g_manual_override) {
+        tick_auto(TRUE);
+    }
+
+    set_all_overlays_topmost(g_topmost_enabled);
+    if (g_topmost_enabled) {
+        topmost_watchdog();
+    }
+
+    if (was_visible) {
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+    }
+}
+
+static void schedule_display_refresh(HWND hwnd)
+{
+    SetTimer(hwnd, TIMER_DISPLAY_REFRESH, 500, NULL);
+}
+
+static BOOL notify_existing_instance(void)
+{
+    HWND existing;
+    DWORD pid;
+    int i;
+
+    for (i = 0; i < 40; i++) {
+        existing = FindWindowW(L"ScreenDimmerMain", NULL);
+        if (existing) {
+            if (!g_show_existing_msg) {
+                return FALSE;
+            }
+            pid = 0;
+            GetWindowThreadProcessId(existing, &pid);
+            if (pid) {
+                AllowSetForegroundWindow(pid);
+            }
+            PostMessageW(existing, g_show_existing_msg, 0, 0);
+            return TRUE;
+        }
+        Sleep(50);
+    }
+
+    return FALSE;
+}
+
+static void close_single_instance_mutex(void)
+{
+    if (g_single_instance_mutex) {
+        CloseHandle(g_single_instance_mutex);
+        g_single_instance_mutex = NULL;
+    }
+}
+
 static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
+    if (g_show_existing_msg && msg == g_show_existing_msg) {
+        show_main_on_cursor_monitor(hwnd);
+        return 0;
+    }
+
     if (msg == g_taskbar_created_msg) {
         if (g_tray_added) {
             g_tray_added = FALSE;
@@ -777,7 +1105,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
         SetTimer(hwnd, TIMER_AUTO, 60000, NULL);
         SetTimer(hwnd, TIMER_TOPMOST, 1200, NULL);
         tick_auto(TRUE);
-        set_all_overlays_topmost(TRUE);
+        set_all_overlays_topmost(g_topmost_enabled);
         return 0;
 
     case WM_COMMAND:
@@ -787,6 +1115,26 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
     case WM_HSCROLL:
         handle_scroll((HWND)lparam);
         return 0;
+
+    case WM_DISPLAYCHANGE:
+    case WM_DPICHANGED:
+        schedule_display_refresh(hwnd);
+        return 0;
+
+    case WM_DEVICECHANGE:
+        if (wparam == DBT_DEVNODES_CHANGED ||
+            wparam == DBT_CONFIGCHANGED ||
+            wparam == DBT_DEVICEARRIVAL ||
+            wparam == DBT_DEVICEREMOVECOMPLETE) {
+            schedule_display_refresh(hwnd);
+        }
+        return TRUE;
+
+    case WM_SETTINGCHANGE:
+        if (wparam == SPI_SETWORKAREA) {
+            schedule_display_refresh(hwnd);
+        }
+        break;
 
     case WM_SIZE:
         if (wparam == SIZE_MINIMIZED) {
@@ -800,6 +1148,9 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
             tick_auto(FALSE);
         } else if (wparam == TIMER_TOPMOST) {
             topmost_watchdog();
+        } else if (wparam == TIMER_DISPLAY_REFRESH) {
+            KillTimer(hwnd, TIMER_DISPLAY_REFRESH);
+            refresh_display_layout(hwnd);
         }
         return 0;
 
@@ -818,6 +1169,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_AUTO);
         KillTimer(hwnd, TIMER_TOPMOST);
+        KillTimer(hwnd, TIMER_DISPLAY_REFRESH);
         remove_tray_icon(hwnd);
         destroy_overlays();
         if (g_font) DeleteObject(g_font);
@@ -894,6 +1246,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
     (void)show_cmd;
 
     g_inst = inst;
+    g_show_existing_msg = RegisterWindowMessageW(SHOW_EXISTING_MESSAGE_NAME);
+    g_single_instance_mutex = CreateMutexW(NULL, TRUE, SINGLE_INSTANCE_MUTEX_NAME);
+    if (g_single_instance_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        notify_existing_instance();
+        close_single_instance_mutex();
+        return 0;
+    } else if (!g_single_instance_mutex && GetLastError() == ERROR_ACCESS_DENIED) {
+        notify_existing_instance();
+        return 0;
+    }
+
     load_optional_apis();
     make_process_dpi_aware();
     g_app_icon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_SCREENDIMMER),
@@ -916,12 +1279,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
 
     if (!register_classes()) {
         MessageBoxW(NULL, utf8_wide("윈도우 클래스를 등록하지 못했습니다."), utf8_wide("화면 필터 밝기"), MB_ICONERROR);
+        close_single_instance_mutex();
         return 1;
     }
 
     create_overlays();
     if (g_monitor_count <= 0) {
         MessageBoxW(NULL, utf8_wide("모니터를 찾지 못했습니다."), utf8_wide("화면 필터 밝기"), MB_ICONERROR);
+        close_single_instance_mutex();
         return 1;
     }
 
@@ -929,6 +1294,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
     if (!hwnd) {
         destroy_overlays();
         MessageBoxW(NULL, utf8_wide("창을 만들지 못했습니다."), utf8_wide("화면 필터 밝기"), MB_ICONERROR);
+        close_single_instance_mutex();
         return 1;
     }
 
@@ -940,5 +1306,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
         DispatchMessageW(&msg);
     }
 
+    close_single_instance_mutex();
     return (int)msg.wParam;
 }
