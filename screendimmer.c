@@ -21,19 +21,24 @@
 #define ID_AUTO 1003
 #define ID_TRAY_SHOW 1004
 #define ID_TRAY_EXIT 1005
+#define ID_STARTUP 1006
 
 #define ID_SLIDER_BASE 2000
 #define ID_BLACKOUT_BASE 3000
 #define ID_VALUE_BASE 4000
+#define ID_MONITOR_AUTO_BASE 5000
 
 #define TIMER_AUTO 1
 #define TIMER_TOPMOST 2
 #define TIMER_DISPLAY_REFRESH 3
 
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_TOPMOST_RECHECK (WM_APP + 2)
 
 #define SINGLE_INSTANCE_MUTEX_NAME L"Local\\ScreenDimmer.SingleInstance"
 #define SHOW_EXISTING_MESSAGE_NAME L"ScreenDimmer.ShowExisting"
+#define STARTUP_RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define STARTUP_VALUE_NAME L"ScreenDimmer"
 
 #ifndef WDA_MONITOR
 #define WDA_MONITOR 0x00000001
@@ -59,6 +64,7 @@ typedef struct {
     HWND overlay;
     int brightness;
     BOOL blackout;
+    BOOL automatic;
 } MonitorDimmer;
 
 typedef struct {
@@ -66,16 +72,17 @@ typedef struct {
     RECT rect;
     int brightness;
     BOOL blackout;
+    BOOL automatic;
 } MonitorState;
 
 static HINSTANCE g_inst;
 static HWND g_main;
 static HWND g_mode_label;
 static HWND g_cfg_label;
-static HWND g_topmost_check;
 static HWND g_sliders[MAX_MONITORS];
 static HWND g_value_labels[MAX_MONITORS];
 static HWND g_blackout_checks[MAX_MONITORS];
+static HWND g_auto_checks[MAX_MONITORS];
 
 static HFONT g_font;
 static HFONT g_title_font;
@@ -86,13 +93,32 @@ static int g_monitor_count;
 
 static ScheduleRule g_schedule[MAX_RULES];
 static int g_schedule_count;
+static BOOL g_using_built_in_schedule;
 static wchar_t g_cfg_path[MAX_PATH];
 
-static BOOL g_manual_override;
+/* Keep the standalone EXE useful until a brightness.cfg is placed beside it. */
+static const ScheduleRule g_default_schedule[] = {
+    { 19 * 60, 21 * 60, 65 },
+    { 21 * 60, 23 * 60, 60 },
+    { 23 * 60, 23 * 60 + 59, 55 },
+    { 23 * 60 + 59, 1 * 60, 50 },
+    { 1 * 60, 2 * 60, 45 },
+    { 2 * 60, 6 * 60, 40 },
+    { 6 * 60, 17 * 60, 90 },
+    { 17 * 60, 19 * 60, 70 }
+};
+
 static BOOL g_controls_ready;
 static BOOL g_updating_controls;
+static int g_displayed_auto_count = -1;
+static BOOL g_cfg_label_initialized;
+static BOOL g_guard_status_shown;
 static BOOL g_tray_added;
 static BOOL g_topmost_enabled = TRUE;
+static BOOL g_topmost_recheck_pending;
+static HWINEVENTHOOK g_topmost_reorder_hook;
+static HWINEVENTHOOK g_topmost_show_hook;
+static HWINEVENTHOOK g_topmost_foreground_hook;
 static UINT g_taskbar_created_msg;
 static UINT g_show_existing_msg;
 static HICON g_app_icon;
@@ -162,7 +188,8 @@ static void hide_overlay_from_capture(HWND hwnd)
 
 static LPCWSTR utf8_wide(const char *text)
 {
-    enum { SLOTS = 16, CHARS = 512 };
+    /* Two slots cover calls that pass both a message and a title to MessageBoxW. */
+    enum { SLOTS = 2, CHARS = 512 };
     static wchar_t buffers[SLOTS][CHARS];
     static int slot;
     wchar_t *out = buffers[slot++ % SLOTS];
@@ -172,7 +199,10 @@ static LPCWSTR utf8_wide(const char *text)
         return out;
     }
 
-    MultiByteToWideChar(CP_UTF8, 0, text, -1, out, CHARS);
+    out[0] = L'\0';
+    if (!MultiByteToWideChar(CP_UTF8, 0, text, -1, out, CHARS)) {
+        return L"";
+    }
     out[CHARS - 1] = L'\0';
     return out;
 }
@@ -240,16 +270,127 @@ static void resolve_cfg_path(void)
     g_cfg_path[MAX_PATH - 1] = L'\0';
 }
 
+static wchar_t *current_startup_command(void)
+{
+    DWORD capacity = MAX_PATH;
+    wchar_t *command = NULL;
+    DWORD length;
+
+    for (;;) {
+        wchar_t *larger = (wchar_t *)realloc(command, (capacity + 3) * sizeof(wchar_t));
+        if (!larger) {
+            free(command);
+            SetLastError(ERROR_OUTOFMEMORY);
+            return NULL;
+        }
+        command = larger;
+        length = GetModuleFileNameW(NULL, command + 1, capacity);
+        if (length == 0) {
+            free(command);
+            return NULL;
+        }
+        if (length < capacity) {
+            break;
+        }
+        if (capacity >= 32768) {
+            free(command);
+            SetLastError(ERROR_FILENAME_EXCED_RANGE);
+            return NULL;
+        }
+        capacity *= 2;
+        if (capacity > 32768) capacity = 32768;
+    }
+
+    command[0] = L'"';
+    command[length + 1] = L'"';
+    command[length + 2] = L'\0';
+    return command;
+}
+
+static BOOL is_startup_registered(void)
+{
+    HKEY key;
+    DWORD type = 0;
+    DWORD bytes = 0;
+    wchar_t stack_value[512];
+    wchar_t *value = stack_value;
+    wchar_t *command;
+    BOOL registered = FALSE;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+        return FALSE;
+    }
+    if (RegQueryValueExW(key, STARTUP_VALUE_NAME, NULL, &type, NULL, &bytes) != ERROR_SUCCESS ||
+        type != REG_SZ || bytes == 0 || bytes > 32770 * sizeof(wchar_t)) {
+        RegCloseKey(key);
+        return FALSE;
+    }
+
+    if (bytes + sizeof(wchar_t) > sizeof(stack_value)) {
+        value = (wchar_t *)malloc(bytes + sizeof(wchar_t));
+    }
+    command = current_startup_command();
+    if (value && command &&
+        RegQueryValueExW(key, STARTUP_VALUE_NAME, NULL, &type, (LPBYTE)value, &bytes) == ERROR_SUCCESS &&
+        type == REG_SZ) {
+        value[bytes / sizeof(wchar_t)] = L'\0';
+        registered = _wcsicmp(value, command) == 0;
+    }
+    if (value != stack_value) free(value);
+    free(command);
+    RegCloseKey(key);
+    return registered;
+}
+
+static LSTATUS set_startup_registered(BOOL enabled)
+{
+    HKEY key;
+    LSTATUS result;
+    wchar_t *command = NULL;
+
+    if (enabled) {
+        command = current_startup_command();
+        if (!command) {
+            return GetLastError() ? (LSTATUS)GetLastError() : ERROR_OUTOFMEMORY;
+        }
+        result = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, NULL, 0,
+                                 KEY_SET_VALUE, NULL, &key, NULL);
+        if (result == ERROR_SUCCESS) {
+            result = RegSetValueExW(key, STARTUP_VALUE_NAME, 0, REG_SZ,
+                                    (const BYTE *)command,
+                                    (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
+            RegCloseKey(key);
+        }
+        free(command);
+        return result;
+    }
+
+    result = RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, KEY_SET_VALUE, &key);
+    if (result == ERROR_FILE_NOT_FOUND) {
+        return ERROR_SUCCESS;
+    }
+    if (result != ERROR_SUCCESS) {
+        return result;
+    }
+    result = RegDeleteValueW(key, STARTUP_VALUE_NAME);
+    RegCloseKey(key);
+    return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
+}
+
 static void load_schedule(void)
 {
     FILE *fp;
     char line[256];
 
     g_schedule_count = 0;
+    g_using_built_in_schedule = FALSE;
     resolve_cfg_path();
 
     fp = _wfopen(g_cfg_path, L"r");
     if (!fp) {
+        memcpy(g_schedule, g_default_schedule, sizeof(g_default_schedule));
+        g_schedule_count = (int)(sizeof(g_default_schedule) / sizeof(g_default_schedule[0]));
+        g_using_built_in_schedule = TRUE;
         return;
     }
 
@@ -353,23 +494,43 @@ static void refresh_status(void)
 {
     char mode[128];
     char cfg[256];
+    int automatic_count = 0;
+    int i;
 
     if (!g_controls_ready) {
         return;
     }
 
-    _snprintf(mode, sizeof(mode), "모드: %s", g_manual_override ? "수동(매뉴얼)" : "자동(cfg)");
-    mode[sizeof(mode) - 1] = '\0';
-    set_text_utf8(g_mode_label, mode);
+    for (i = 0; i < g_monitor_count; i++) {
+        if (g_monitors[i].automatic) {
+            automatic_count++;
+        }
+    }
 
-    _snprintf(cfg, sizeof(cfg), "cfg: %s | 규칙 %d개", CFG_NAME, g_schedule_count);
-    cfg[sizeof(cfg) - 1] = '\0';
-    set_text_utf8(g_cfg_label, cfg);
+    if (automatic_count != g_displayed_auto_count || g_guard_status_shown) {
+        _snprintf(mode, sizeof(mode), "모드: 자동(cfg) %d개 / 수동 %d개",
+                  automatic_count, g_monitor_count - automatic_count);
+        mode[sizeof(mode) - 1] = '\0';
+        set_text_utf8(g_mode_label, mode);
+        g_displayed_auto_count = automatic_count;
+        g_guard_status_shown = FALSE;
+    }
+
+    if (!g_cfg_label_initialized) {
+        _snprintf(cfg, sizeof(cfg), "cfg: %s | 규칙 %d개",
+                  g_using_built_in_schedule ? "내장 기본값" : CFG_NAME, g_schedule_count);
+        cfg[sizeof(cfg) - 1] = '\0';
+        set_text_utf8(g_cfg_label, cfg);
+        g_cfg_label_initialized = TRUE;
+    }
 }
 
 static void set_guard_status(void)
 {
-    set_text_utf8(g_mode_label, "모든 모니터를 100% 어둡게 둘 수 없습니다.");
+    if (!g_guard_status_shown) {
+        set_text_utf8(g_mode_label, "모든 모니터를 100% 어둡게 둘 수 없습니다.");
+        g_guard_status_shown = TRUE;
+    }
 }
 
 static void update_value_label(int index)
@@ -410,9 +571,14 @@ static BOOL would_all_blackout(int changed_index, BOOL changed_value)
 
 static void set_blackout(int index, BOOL enabled, BOOL manual)
 {
+    MonitorDimmer *monitor;
+    BOOL mode_changed = FALSE;
+
     if (index < 0 || index >= g_monitor_count) {
         return;
     }
+
+    monitor = &g_monitors[index];
 
     if (enabled && would_all_blackout(index, TRUE)) {
         g_updating_controls = TRUE;
@@ -424,40 +590,61 @@ static void set_blackout(int index, BOOL enabled, BOOL manual)
         return;
     }
 
-    g_monitors[index].blackout = enabled;
-    EnableWindow(g_sliders[index], !enabled);
-    update_overlay_alpha(index);
-    update_value_label(index);
-
-    if (manual) {
-        g_manual_override = TRUE;
-    }
-    refresh_status();
-}
-
-static void set_brightness(int index, int value, BOOL manual)
-{
-    if (index < 0 || index >= g_monitor_count) {
-        return;
+    if (monitor->blackout != enabled) {
+        monitor->blackout = enabled;
+        EnableWindow(g_sliders[index], !enabled);
+        update_overlay_alpha(index);
+        update_value_label(index);
     }
 
-    g_monitors[index].brightness = clamp_int(value, 5, 100);
-    update_overlay_alpha(index);
-    update_value_label(index);
-
-    if (manual) {
-        g_manual_override = TRUE;
+    if (manual && monitor->automatic) {
+        monitor->automatic = FALSE;
+        SendMessageW(g_auto_checks[index], BM_SETCHECK, BST_UNCHECKED, 0);
+        mode_changed = TRUE;
+    }
+    if (mode_changed || g_guard_status_shown) {
         refresh_status();
     }
 }
 
-static void apply_value_to_all(int value)
+static void set_brightness(int index, int value, BOOL manual)
+{
+    MonitorDimmer *monitor;
+    int brightness;
+
+    if (index < 0 || index >= g_monitor_count) {
+        return;
+    }
+
+    monitor = &g_monitors[index];
+    brightness = clamp_int(value, 5, 100);
+    if (monitor->brightness != brightness) {
+        monitor->brightness = brightness;
+        update_overlay_alpha(index);
+        update_value_label(index);
+    }
+
+    if (manual) {
+        if (monitor->automatic) {
+            monitor->automatic = FALSE;
+            SendMessageW(g_auto_checks[index], BM_SETCHECK, BST_UNCHECKED, 0);
+            refresh_status();
+        } else if (g_guard_status_shown) {
+            refresh_status();
+        }
+    }
+}
+
+static void apply_value_to_automatic(int value)
 {
     int i;
     int brightness = clamp_int(value, 5, 100);
 
     g_updating_controls = TRUE;
     for (i = 0; i < g_monitor_count; i++) {
+        if (!g_monitors[i].automatic || g_monitors[i].brightness == brightness) {
+            continue;
+        }
         g_monitors[i].brightness = brightness;
         SendMessageW(g_sliders[i], TBM_SETPOS, TRUE, brightness);
         update_overlay_alpha(i);
@@ -466,21 +653,55 @@ static void apply_value_to_all(int value)
     g_updating_controls = FALSE;
 }
 
-static void tick_auto(BOOL force)
+static void tick_auto(void)
 {
     int value;
+    int i;
 
-    if (g_manual_override && !force) {
+    if (g_schedule_count <= 0) {
         return;
     }
-    if (g_schedule_count <= 0) {
+
+    for (i = 0; i < g_monitor_count; i++) {
+        if (g_monitors[i].automatic) {
+            break;
+        }
+    }
+    if (i == g_monitor_count) {
         return;
     }
 
     value = pick_schedule_value();
     if (value >= 0) {
-        apply_value_to_all(value);
+        apply_value_to_automatic(value);
     }
+}
+
+static void set_monitor_auto(int index, BOOL enabled)
+{
+    BOOL was_blackout;
+    int old_brightness;
+
+    if (index < 0 || index >= g_monitor_count) {
+        return;
+    }
+
+    g_monitors[index].automatic = enabled;
+    if (enabled) {
+        was_blackout = g_monitors[index].blackout;
+        old_brightness = g_monitors[index].brightness;
+        if (was_blackout) {
+            g_monitors[index].blackout = FALSE;
+            SendMessageW(g_blackout_checks[index], BM_SETCHECK, BST_UNCHECKED, 0);
+            EnableWindow(g_sliders[index], TRUE);
+        }
+        tick_auto();
+        if (was_blackout && old_brightness == g_monitors[index].brightness) {
+            update_overlay_alpha(index);
+            update_value_label(index);
+        }
+    }
+    refresh_status();
 }
 
 static LRESULT CALLBACK overlay_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
@@ -520,6 +741,7 @@ static BOOL CALLBACK enum_monitor_proc(HMONITOR monitor, HDC hdc, LPRECT rect, L
     dimmer->rect = info.rcMonitor;
     dimmer->brightness = 100;
     dimmer->blackout = FALSE;
+    dimmer->automatic = TRUE;
 
     overlay = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -572,6 +794,7 @@ static void snapshot_monitor_states(MonitorState states[MAX_MONITORS], int *coun
         states[i].rect = g_monitors[i].rect;
         states[i].brightness = g_monitors[i].brightness;
         states[i].blackout = g_monitors[i].blackout;
+        states[i].automatic = g_monitors[i].automatic;
     }
 }
 
@@ -619,6 +842,7 @@ static void restore_monitor_states(MonitorState states[MAX_MONITORS], int count)
             used[match] = TRUE;
             g_monitors[i].brightness = states[match].brightness;
             g_monitors[i].blackout = states[match].blackout;
+            g_monitors[i].automatic = states[match].automatic;
         }
     }
 
@@ -645,23 +869,19 @@ static void create_main_controls(HWND hwnd)
     int i;
 
     create_control(hwnd, L"STATIC", "화면 필터 밝기", SS_LEFT,
-                   0, 16, 14, 500, 28, g_title_font);
+                   0, 16, 14, 580, 28, g_title_font);
     create_control(hwnd, L"STATIC", "슬라이더는 밝기, 100% 어둡기는 안전을 위해 모든 모니터에 동시에 적용되지 않습니다.",
-                   SS_LEFT, 0, 16, 45, 510, 22, g_font);
+                   SS_LEFT, 0, 16, 45, 580, 22, g_font);
 
     g_mode_label = create_control(hwnd, L"STATIC", "", SS_LEFT,
-                                  0, 16, 74, 500, 22, g_font);
+                                  0, 16, 74, 580, 22, g_font);
     g_cfg_label = create_control(hwnd, L"STATIC", "", SS_LEFT,
-                                 0, 16, 98, 500, 22, g_font);
-
-    g_topmost_check = create_control(hwnd, L"BUTTON", "필터를 항상 최상위로 설정",
-                                     BS_AUTOCHECKBOX, ID_TOPMOST, 16, 126, 260, 24, g_font);
-    SendMessageW(g_topmost_check, BM_SETCHECK, g_topmost_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+                                 0, 16, 98, 580, 22, g_font);
 
     create_control(hwnd, L"STATIC", "", SS_ETCHEDHORZ,
-                   0, 16, 158, 508, 2, g_font);
+                   0, 16, 128, 580, 2, g_font);
 
-    y = 176;
+    y = 146;
     for (i = 0; i < g_monitor_count; i++) {
         char name[64];
         _snprintf(name, sizeof(name), "모니터 %d", i + 1);
@@ -677,7 +897,7 @@ static void create_main_controls(HWND hwnd)
             WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
             100,
             y,
-            270,
+            242,
             34,
             hwnd,
             (HMENU)(INT_PTR)(ID_SLIDER_BASE + i),
@@ -689,10 +909,15 @@ static void create_main_controls(HWND hwnd)
         SendMessageW(g_sliders[i], TBM_SETPOS, TRUE, g_monitors[i].brightness);
 
         g_value_labels[i] = create_control(hwnd, L"STATIC", "100%", SS_RIGHT,
-                                           ID_VALUE_BASE + i, 380, y + 4, 52, 24, g_font);
+                                           ID_VALUE_BASE + i, 348, y + 4, 52, 24, g_font);
+        g_auto_checks[i] = create_control(hwnd, L"BUTTON", "자동(cfg)",
+                                          BS_AUTOCHECKBOX, ID_MONITOR_AUTO_BASE + i,
+                                          410, y + 2, 86, 24, g_font);
+        SendMessageW(g_auto_checks[i], BM_SETCHECK,
+                     g_monitors[i].automatic ? BST_CHECKED : BST_UNCHECKED, 0);
         g_blackout_checks[i] = create_control(hwnd, L"BUTTON", "100% 어둡기",
                                               BS_AUTOCHECKBOX, ID_BLACKOUT_BASE + i,
-                                              444, y + 2, 96, 24, g_font);
+                                              504, y + 2, 96, 24, g_font);
         SendMessageW(g_blackout_checks[i], BM_SETCHECK,
                      g_monitors[i].blackout ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_sliders[i], !g_monitors[i].blackout);
@@ -700,9 +925,9 @@ static void create_main_controls(HWND hwnd)
     }
 
     create_control(hwnd, L"BUTTON", "필터 다시 앞으로", BS_PUSHBUTTON,
-                   ID_RAISE, 16, y + 12, 245, 34, g_font);
-    create_control(hwnd, L"BUTTON", "자동(cfg) 모드로", BS_PUSHBUTTON,
-                   ID_AUTO, 279, y + 12, 245, 34, g_font);
+                   ID_RAISE, 16, y + 12, 282, 34, g_font);
+    create_control(hwnd, L"BUTTON", "모든 모니터 자동(cfg)", BS_PUSHBUTTON,
+                   ID_AUTO, 314, y + 12, 282, 34, g_font);
 
     g_controls_ready = TRUE;
     for (i = 0; i < g_monitor_count; i++) {
@@ -736,21 +961,137 @@ static void set_all_overlays_topmost(BOOL enabled)
     }
 }
 
+static BOOL is_own_window(HWND hwnd)
+{
+    int i;
+
+    if (hwnd == g_main) {
+        return TRUE;
+    }
+    for (i = 0; i < g_monitor_count; i++) {
+        if (hwnd == g_monitors[i].overlay) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL has_overlapping_window_above(HWND hwnd, const RECT *bounds)
+{
+    HWND above;
+    RECT window_rect;
+    RECT overlap;
+
+    for (above = GetWindow(hwnd, GW_HWNDPREV); above;
+         above = GetWindow(above, GW_HWNDPREV)) {
+        if (is_own_window(above) || !IsWindowVisible(above) || IsIconic(above)) {
+            continue;
+        }
+        if (GetWindowRect(above, &window_rect) &&
+            IntersectRect(&overlap, bounds, &window_rect)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static void topmost_watchdog(void)
 {
     int i;
+    BOOL raised_overlay = FALSE;
+    RECT main_rect;
 
     if (!g_controls_ready || !g_topmost_enabled) {
         return;
     }
 
     for (i = 0; i < g_monitor_count; i++) {
-        ensure_overlay_topmost(i);
+        HWND overlay = g_monitors[i].overlay;
+        if (overlay &&
+            (!(GetWindowLongPtrW(overlay, GWL_EXSTYLE) & WS_EX_TOPMOST) ||
+             has_overlapping_window_above(overlay, &g_monitors[i].rect))) {
+            ensure_overlay_topmost(i);
+            raised_overlay = TRUE;
+        }
     }
 
-    if (g_main && IsWindowVisible(g_main)) {
+    if (g_main && IsWindowVisible(g_main) &&
+        (raised_overlay ||
+         !(GetWindowLongPtrW(g_main, GWL_EXSTYLE) & WS_EX_TOPMOST) ||
+         (GetWindowRect(g_main, &main_rect) &&
+          has_overlapping_window_above(g_main, &main_rect)))) {
         SetWindowPos(g_main, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+static void CALLBACK topmost_win_event(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                                       LONG object_id, LONG child_id,
+                                       DWORD event_thread, DWORD event_time)
+{
+    (void)hook;
+    (void)event_thread;
+    (void)event_time;
+
+    if (!g_topmost_enabled || !g_main || !hwnd ||
+        object_id != OBJID_WINDOW || child_id != CHILDID_SELF) {
+        return;
+    }
+
+    /* An ordinary shown/activated window cannot overtake a topmost overlay.
+       A z-order change is still checked because its event names the parent. */
+    if (event != EVENT_OBJECT_REORDER &&
+        !(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
+        return;
+    }
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd) {
+        return;
+    }
+
+    /* Out-of-context callbacks arrive on the UI thread. Coalesce busy event bursts. */
+    if (!g_topmost_recheck_pending && PostMessageW(g_main, WM_TOPMOST_RECHECK, 0, 0)) {
+        g_topmost_recheck_pending = TRUE;
+    }
+}
+
+static void update_topmost_monitoring(HWND hwnd)
+{
+    if (g_topmost_enabled) {
+        if (!g_topmost_reorder_hook) {
+            g_topmost_reorder_hook = SetWinEventHook(
+                EVENT_OBJECT_REORDER, EVENT_OBJECT_REORDER, NULL,
+                topmost_win_event, 0, 0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        }
+        if (!g_topmost_show_hook) {
+            g_topmost_show_hook = SetWinEventHook(
+                EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, NULL,
+                topmost_win_event, 0, 0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        }
+        if (!g_topmost_foreground_hook) {
+            g_topmost_foreground_hook = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL,
+                topmost_win_event, 0, 0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        }
+        SetTimer(hwnd, TIMER_TOPMOST, 600, NULL);
+        topmost_watchdog();
+    } else {
+        KillTimer(hwnd, TIMER_TOPMOST);
+        if (g_topmost_reorder_hook) {
+            UnhookWinEvent(g_topmost_reorder_hook);
+            g_topmost_reorder_hook = NULL;
+        }
+        if (g_topmost_show_hook) {
+            UnhookWinEvent(g_topmost_show_hook);
+            g_topmost_show_hook = NULL;
+        }
+        if (g_topmost_foreground_hook) {
+            UnhookWinEvent(g_topmost_foreground_hook);
+            g_topmost_foreground_hook = NULL;
+        }
+        g_topmost_recheck_pending = FALSE;
     }
 }
 
@@ -886,11 +1227,27 @@ static void show_tray_menu(HWND hwnd)
 static void handle_command(HWND hwnd, int id)
 {
     if (id == ID_TOPMOST) {
-        BOOL enabled = SendMessageW(g_topmost_check, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        BOOL enabled = !g_topmost_enabled;
         g_topmost_enabled = enabled;
+        CheckMenuItem(GetMenu(hwnd), ID_TOPMOST,
+                      MF_BYCOMMAND | (enabled ? MF_CHECKED : MF_UNCHECKED));
         set_all_overlays_topmost(enabled);
-        if (enabled) {
-            topmost_watchdog();
+        update_topmost_monitoring(hwnd);
+        return;
+    }
+
+    if (id == ID_STARTUP) {
+        BOOL enabled = !is_startup_registered();
+        LSTATUS result = set_startup_registered(enabled);
+        if (result == ERROR_SUCCESS) {
+            CheckMenuItem(GetMenu(hwnd), ID_STARTUP,
+                          MF_BYCOMMAND | (enabled ? MF_CHECKED : MF_UNCHECKED));
+        } else {
+            wchar_t message[160];
+            _snwprintf(message, sizeof(message) / sizeof(message[0]),
+                       L"시작 프로그램 설정을 변경하지 못했습니다. (오류 %ld)", (long)result);
+            message[(sizeof(message) / sizeof(message[0])) - 1] = L'\0';
+            MessageBoxW(hwnd, message, utf8_wide("화면 필터 밝기"), MB_OK | MB_ICONERROR);
         }
         return;
     }
@@ -901,9 +1258,20 @@ static void handle_command(HWND hwnd, int id)
     }
 
     if (id == ID_AUTO) {
-        g_manual_override = FALSE;
+        int i;
+        for (i = 0; i < g_monitor_count; i++) {
+            g_monitors[i].automatic = TRUE;
+            SendMessageW(g_auto_checks[i], BM_SETCHECK, BST_CHECKED, 0);
+            g_monitors[i].blackout = FALSE;
+            SendMessageW(g_blackout_checks[i], BM_SETCHECK, BST_UNCHECKED, 0);
+            EnableWindow(g_sliders[i], TRUE);
+        }
+        tick_auto();
+        for (i = 0; i < g_monitor_count; i++) {
+            update_overlay_alpha(i);
+            update_value_label(i);
+        }
         refresh_status();
-        tick_auto(TRUE);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
         return;
@@ -916,6 +1284,17 @@ static void handle_command(HWND hwnd, int id)
 
     if (id == ID_TRAY_EXIT) {
         DestroyWindow(hwnd);
+        return;
+    }
+
+    if (id >= ID_MONITOR_AUTO_BASE && id < ID_MONITOR_AUTO_BASE + g_monitor_count) {
+        int index = id - ID_MONITOR_AUTO_BASE;
+        BOOL enabled;
+        if (g_updating_controls) {
+            return;
+        }
+        enabled = SendMessageW(g_auto_checks[index], BM_GETCHECK, 0, 0) == BST_CHECKED;
+        set_monitor_auto(index, enabled);
         return;
     }
 
@@ -973,9 +1352,12 @@ static void destroy_child_controls(HWND parent)
     ZeroMemory(g_sliders, sizeof(g_sliders));
     ZeroMemory(g_value_labels, sizeof(g_value_labels));
     ZeroMemory(g_blackout_checks, sizeof(g_blackout_checks));
+    ZeroMemory(g_auto_checks, sizeof(g_auto_checks));
     g_mode_label = NULL;
     g_cfg_label = NULL;
-    g_topmost_check = NULL;
+    g_displayed_auto_count = -1;
+    g_cfg_label_initialized = FALSE;
+    g_guard_status_shown = FALSE;
     g_updating_controls = FALSE;
 }
 
@@ -989,17 +1371,38 @@ static void resize_main_window(HWND hwnd)
 
     style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
     ex_style = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    client_w = 548;
-    client_h = 250 + g_monitor_count * 40;
+    client_w = 612;
+    client_h = 220 + g_monitor_count * 40;
 
     rect.left = 0;
     rect.top = 0;
     rect.right = client_w;
     rect.bottom = client_h;
-    AdjustWindowRectEx(&rect, style, FALSE, ex_style);
+    AdjustWindowRectEx(&rect, style, TRUE, ex_style);
 
     SetWindowPos(hwnd, NULL, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void sync_main_controls(void)
+{
+    int i;
+
+    if (!g_controls_ready) {
+        return;
+    }
+    g_updating_controls = TRUE;
+    for (i = 0; i < g_monitor_count; i++) {
+        SendMessageW(g_sliders[i], TBM_SETPOS, TRUE, g_monitors[i].brightness);
+        SendMessageW(g_auto_checks[i], BM_SETCHECK,
+                     g_monitors[i].automatic ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(g_blackout_checks[i], BM_SETCHECK,
+                     g_monitors[i].blackout ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(g_sliders[i], !g_monitors[i].blackout);
+        update_value_label(i);
+    }
+    g_updating_controls = FALSE;
+    refresh_status();
 }
 
 static void destroy_overlays(void)
@@ -1013,34 +1416,69 @@ static void destroy_overlays(void)
     }
 }
 
+typedef struct {
+    BOOL matched[MAX_MONITORS];
+    int count;
+} MonitorLayoutCheck;
+
+static BOOL CALLBACK check_monitor_layout(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM data)
+{
+    MonitorLayoutCheck *check = (MonitorLayoutCheck *)data;
+    int i;
+
+    (void)dc;
+    if (!rect || check->count >= MAX_MONITORS) {
+        return FALSE;
+    }
+    check->count++;
+    for (i = 0; i < g_monitor_count; i++) {
+        if (!check->matched[i] && IsWindow(g_monitors[i].overlay) &&
+            g_monitors[i].handle == monitor &&
+            same_rect(&g_monitors[i].rect, rect)) {
+            check->matched[i] = TRUE;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL monitor_layout_unchanged(void)
+{
+    MonitorLayoutCheck check;
+
+    ZeroMemory(&check, sizeof(check));
+    return EnumDisplayMonitors(NULL, NULL, check_monitor_layout, (LPARAM)&check) &&
+           check.count == g_monitor_count;
+}
+
 static void refresh_display_layout(HWND hwnd)
 {
     MonitorState states[MAX_MONITORS];
     int state_count;
-    BOOL was_visible;
+
+    if (monitor_layout_unchanged()) {
+        return;
+    }
 
     snapshot_monitor_states(states, &state_count);
-    was_visible = IsWindowVisible(hwnd);
 
     destroy_overlays();
     create_overlays();
     restore_monitor_states(states, state_count);
 
-    destroy_child_controls(hwnd);
-    resize_main_window(hwnd);
-    create_main_controls(hwnd);
-
-    if (!g_manual_override) {
-        tick_auto(TRUE);
+    if (state_count == g_monitor_count && g_controls_ready) {
+        sync_main_controls();
+    } else {
+        destroy_child_controls(hwnd);
+        resize_main_window(hwnd);
+        create_main_controls(hwnd);
     }
+
+    tick_auto();
 
     set_all_overlays_topmost(g_topmost_enabled);
     if (g_topmost_enabled) {
         topmost_watchdog();
-    }
-
-    if (was_visible) {
-        ShowWindow(hwnd, SW_SHOWNORMAL);
     }
 }
 
@@ -1083,6 +1521,29 @@ static void close_single_instance_mutex(void)
     }
 }
 
+static void release_graphics_resources(void)
+{
+    UnregisterClassW(L"ScreenDimmerMain", g_inst);
+    UnregisterClassW(L"ScreenDimmerOverlay", g_inst);
+
+    if (g_font) {
+        DeleteObject(g_font);
+        g_font = NULL;
+    }
+    if (g_title_font) {
+        DeleteObject(g_title_font);
+        g_title_font = NULL;
+    }
+    if (g_black_brush) {
+        DeleteObject(g_black_brush);
+        g_black_brush = NULL;
+    }
+    if (g_app_icon) {
+        DestroyIcon(g_app_icon);
+        g_app_icon = NULL;
+    }
+}
+
 static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     if (g_show_existing_msg && msg == g_show_existing_msg) {
@@ -1103,9 +1564,9 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
         g_main = hwnd;
         create_main_controls(hwnd);
         SetTimer(hwnd, TIMER_AUTO, 60000, NULL);
-        SetTimer(hwnd, TIMER_TOPMOST, 1200, NULL);
-        tick_auto(TRUE);
+        tick_auto();
         set_all_overlays_topmost(g_topmost_enabled);
+        update_topmost_monitoring(hwnd);
         return 0;
 
     case WM_COMMAND:
@@ -1145,13 +1606,18 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
 
     case WM_TIMER:
         if (wparam == TIMER_AUTO) {
-            tick_auto(FALSE);
+            tick_auto();
         } else if (wparam == TIMER_TOPMOST) {
             topmost_watchdog();
         } else if (wparam == TIMER_DISPLAY_REFRESH) {
             KillTimer(hwnd, TIMER_DISPLAY_REFRESH);
             refresh_display_layout(hwnd);
         }
+        return 0;
+
+    case WM_TOPMOST_RECHECK:
+        g_topmost_recheck_pending = FALSE;
+        topmost_watchdog();
         return 0;
 
     case WM_TRAYICON:
@@ -1168,13 +1634,11 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_AUTO);
-        KillTimer(hwnd, TIMER_TOPMOST);
+        g_topmost_enabled = FALSE;
+        update_topmost_monitoring(hwnd);
         KillTimer(hwnd, TIMER_DISPLAY_REFRESH);
         remove_tray_icon(hwnd);
         destroy_overlays();
-        if (g_font) DeleteObject(g_font);
-        if (g_title_font) DeleteObject(g_title_font);
-        if (g_black_brush) DeleteObject(g_black_brush);
         PostQuitMessage(0);
         return 0;
     }
@@ -1206,21 +1670,51 @@ static BOOL register_classes(void)
     return RegisterClassW(&wc) != 0;
 }
 
+static HMENU create_main_menu(void)
+{
+    HMENU menu = CreateMenu();
+    HMENU settings = CreatePopupMenu();
+
+    if (!menu || !settings) {
+        if (settings) DestroyMenu(settings);
+        if (menu) DestroyMenu(menu);
+        return NULL;
+    }
+
+    if (!AppendMenuW(settings, MF_STRING | (g_topmost_enabled ? MF_CHECKED : 0),
+                     ID_TOPMOST, utf8_wide("필터를 항상 최상위로 설정")) ||
+        !AppendMenuW(settings, MF_STRING | (is_startup_registered() ? MF_CHECKED : 0),
+                     ID_STARTUP, utf8_wide("Windows 시작 시 자동 실행")) ||
+        !AppendMenuW(menu, MF_POPUP, (UINT_PTR)settings, utf8_wide("설정"))) {
+        DestroyMenu(settings);
+        DestroyMenu(menu);
+        return NULL;
+    }
+
+    return menu;
+}
+
 static HWND create_main_window(void)
 {
     RECT rect;
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     DWORD ex_style = WS_EX_TOPMOST;
-    int client_w = 548;
-    int client_h = 250 + g_monitor_count * 40;
+    HMENU menu = create_main_menu();
+    HWND hwnd;
+    int client_w = 612;
+    int client_h = 220 + g_monitor_count * 40;
+
+    if (!menu) {
+        return NULL;
+    }
 
     rect.left = 0;
     rect.top = 0;
     rect.right = client_w;
     rect.bottom = client_h;
-    AdjustWindowRectEx(&rect, style, FALSE, ex_style);
+    AdjustWindowRectEx(&rect, style, TRUE, ex_style);
 
-    return CreateWindowExW(
+    hwnd = CreateWindowExW(
         ex_style,
         L"ScreenDimmerMain",
         utf8_wide("화면 필터 밝기"),
@@ -1230,9 +1724,13 @@ static HWND create_main_window(void)
         rect.right - rect.left,
         rect.bottom - rect.top,
         NULL,
-        NULL,
+        menu,
         g_inst,
         NULL);
+    if (!hwnd) {
+        DestroyMenu(menu);
+    }
+    return hwnd;
 }
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
@@ -1279,6 +1777,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
 
     if (!register_classes()) {
         MessageBoxW(NULL, utf8_wide("윈도우 클래스를 등록하지 못했습니다."), utf8_wide("화면 필터 밝기"), MB_ICONERROR);
+        release_graphics_resources();
         close_single_instance_mutex();
         return 1;
     }
@@ -1286,6 +1785,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
     create_overlays();
     if (g_monitor_count <= 0) {
         MessageBoxW(NULL, utf8_wide("모니터를 찾지 못했습니다."), utf8_wide("화면 필터 밝기"), MB_ICONERROR);
+        release_graphics_resources();
         close_single_instance_mutex();
         return 1;
     }
@@ -1294,6 +1794,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
     if (!hwnd) {
         destroy_overlays();
         MessageBoxW(NULL, utf8_wide("창을 만들지 못했습니다."), utf8_wide("화면 필터 밝기"), MB_ICONERROR);
+        release_graphics_resources();
         close_single_instance_mutex();
         return 1;
     }
@@ -1306,6 +1807,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
         DispatchMessageW(&msg);
     }
 
+    release_graphics_resources();
     close_single_instance_mutex();
     return (int)msg.wParam;
 }
