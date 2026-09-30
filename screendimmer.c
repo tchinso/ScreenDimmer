@@ -1,10 +1,12 @@
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
 #include <windows.h>
 #include <commctrl.h>
 #include <dbt.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -307,7 +309,7 @@ static wchar_t *current_startup_command(void)
     return command;
 }
 
-static BOOL is_startup_registered(void)
+static BOOL is_run_registered(void)
 {
     HKEY key;
     DWORD type = 0;
@@ -342,7 +344,7 @@ static BOOL is_startup_registered(void)
     return registered;
 }
 
-static LSTATUS set_startup_registered(BOOL enabled)
+static LSTATUS set_run_registered(BOOL enabled)
 {
     HKEY key;
     LSTATUS result;
@@ -375,6 +377,113 @@ static LSTATUS set_startup_registered(BOOL enabled)
     result = RegDeleteValueW(key, STARTUP_VALUE_NAME);
     RegCloseKey(key);
     return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
+}
+
+/* Register both Explorer startup mechanisms. The mutex prevents duplicate instances. */
+static LSTATUS startup_link(BOOL write, BOOL enabled)
+{
+    wchar_t path[MAX_PATH], target[32768], directory[32768];
+    wchar_t *command = NULL, *slash;
+    IShellLinkW *link = NULL;
+    IPersistFile *file = NULL;
+    HRESULT init, hr;
+    LSTATUS result = ERROR_SUCCESS;
+
+    hr = SHGetFolderPathW(NULL, CSIDL_STARTUP | CSIDL_FLAG_CREATE, NULL,
+                          SHGFP_TYPE_CURRENT, path);
+    if (FAILED(hr)) return ERROR_PATH_NOT_FOUND;
+    if (wcslen(path) + wcslen(L"\\ScreenDimmer.lnk") >= MAX_PATH)
+        return ERROR_FILENAME_EXCED_RANGE;
+    wcscat(path, L"\\ScreenDimmer.lnk");
+    if (write && !enabled) {
+        if (DeleteFileW(path)) return ERROR_SUCCESS;
+        result = GetLastError();
+        return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
+    }
+    command = current_startup_command();
+    if (!command) return GetLastError();
+    command[wcslen(command) - 1] = L'\0';
+    wcscpy(directory, command + 1);
+    slash = wcsrchr(directory, L'\\');
+    if (slash) *slash = L'\0';
+    init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(init) && init != RPC_E_CHANGED_MODE) {
+        free(command);
+        return ERROR_GEN_FAILURE;
+    }
+    hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IShellLinkW, (void **)&link);
+    if (SUCCEEDED(hr))
+        hr = IShellLinkW_QueryInterface(link, &IID_IPersistFile, (void **)&file);
+    if (SUCCEEDED(hr) && write) {
+        hr = IShellLinkW_SetPath(link, command + 1);
+        if (SUCCEEDED(hr)) hr = IShellLinkW_SetWorkingDirectory(link, directory);
+        if (SUCCEEDED(hr)) hr = IPersistFile_Save(file, path, TRUE);
+    } else if (SUCCEEDED(hr)) {
+        hr = IPersistFile_Load(file, path, STGM_READ);
+        if (SUCCEEDED(hr)) hr = IShellLinkW_GetPath(link, target, 32768, NULL, SLGP_RAWPATH);
+        if (SUCCEEDED(hr) && _wcsicmp(target, command + 1) != 0) hr = E_FAIL;
+    }
+    if (FAILED(hr)) result = HRESULT_FACILITY(hr) == FACILITY_WIN32
+                            ? HRESULT_CODE(hr) : ERROR_GEN_FAILURE;
+    if (file) IPersistFile_Release(file);
+    if (link) IShellLinkW_Release(link);
+    if (SUCCEEDED(init)) CoUninitialize();
+    free(command);
+    return result;
+}
+
+static BOOL startup_allowed(LPCWSTR category, LPCWSTR name)
+{
+    wchar_t path[160];
+    BYTE value[12];
+    DWORD bytes = sizeof(value), type;
+    LSTATUS result;
+    _snwprintf(path, 160, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\%ls", category);
+    result = RegGetValueW(HKEY_CURRENT_USER, path, name, RRF_RT_REG_BINARY,
+                          &type, value, &bytes);
+    /* Explorer records disabled entries with state 3 (or 7). */
+    return result == ERROR_FILE_NOT_FOUND ||
+           (result == ERROR_SUCCESS && bytes >= 4 && (value[0] == 2 || value[0] == 6));
+}
+
+static LSTATUS clear_startup_override(LPCWSTR category, LPCWSTR name)
+{
+    wchar_t path[160];
+    HKEY key;
+    LSTATUS result;
+    _snwprintf(path, 160, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\%ls", category);
+    result = RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_SET_VALUE, &key);
+    if (result == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
+    if (result != ERROR_SUCCESS) return result;
+    result = RegDeleteValueW(key, name);
+    RegCloseKey(key);
+    return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
+}
+
+static BOOL is_startup_registered(void)
+{
+    return is_run_registered() && startup_allowed(L"Run", STARTUP_VALUE_NAME) &&
+           startup_link(FALSE, TRUE) == ERROR_SUCCESS &&
+           startup_allowed(L"StartupFolder", L"ScreenDimmer.lnk");
+}
+
+static LSTATUS set_startup_registered(BOOL enabled)
+{
+    LSTATUS run_result = set_run_registered(enabled);
+    LSTATUS link_result = startup_link(TRUE, enabled);
+    LSTATUS approval_result = ERROR_SUCCESS, folder_result = ERROR_SUCCESS;
+    if (enabled) {
+        /* Only reset a Windows disable override when the user explicitly enables startup. */
+        approval_result = clear_startup_override(L"Run", STARTUP_VALUE_NAME);
+        folder_result = clear_startup_override(L"StartupFolder", L"ScreenDimmer.lnk");
+    }
+    if (run_result != ERROR_SUCCESS) return run_result;
+    if (link_result != ERROR_SUCCESS) return link_result;
+    if (approval_result != ERROR_SUCCESS) return approval_result;
+    if (folder_result != ERROR_SUCCESS) return folder_result;
+    if (enabled && !is_startup_registered()) return ERROR_INVALID_DATA;
+    return ERROR_SUCCESS;
 }
 
 static void load_schedule(void)

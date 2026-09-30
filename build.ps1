@@ -16,7 +16,7 @@ try {
         -Wall -Wextra -Wpedantic -mwindows -static -s `
         '-Wl,--gc-sections' 'screendimmer.c' $resourceObject `
         -o (Join-Path $outputDir 'ScreenDimmer.exe') `
-        -lcomctl32 -lshell32 -ladvapi32 -lgdi32 -luser32
+        -lcomctl32 -lshell32 -ladvapi32 -lgdi32 -luser32 -lole32 -luuid
     if ($LASTEXITCODE -ne 0) { throw "gcc failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
