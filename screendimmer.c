@@ -33,6 +33,7 @@
 #define TIMER_AUTO 1
 #define TIMER_TOPMOST 2
 #define TIMER_DISPLAY_REFRESH 3
+#define TIMER_TRAY_RETRY 4
 
 #define WM_TRAYICON (WM_APP + 1)
 #define WM_TOPMOST_RECHECK (WM_APP + 2)
@@ -41,6 +42,7 @@
 #define SHOW_EXISTING_MESSAGE_NAME L"ScreenDimmer.ShowExisting"
 #define STARTUP_RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define STARTUP_VALUE_NAME L"ScreenDimmer"
+#define STARTUP_ARGUMENTS L"silent"
 
 #ifndef WDA_MONITOR
 #define WDA_MONITOR 0x00000001
@@ -116,6 +118,7 @@ static int g_displayed_auto_count = -1;
 static BOOL g_cfg_label_initialized;
 static BOOL g_guard_status_shown;
 static BOOL g_tray_added;
+static BOOL g_tray_requested;
 static BOOL g_topmost_enabled = TRUE;
 static BOOL g_topmost_recheck_pending;
 static HWINEVENTHOOK g_topmost_reorder_hook;
@@ -272,30 +275,50 @@ static void resolve_cfg_path(void)
     g_cfg_path[MAX_PATH - 1] = L'\0';
 }
 
-static wchar_t *current_startup_command(void)
+static BOOL has_silent_option(void)
+{
+    int argc, i;
+    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    BOOL silent = FALSE;
+
+    if (!argv) return FALSE;
+    for (i = 1; i < argc; i++) {
+        if (_wcsicmp(argv[i], STARTUP_ARGUMENTS) == 0 ||
+            _wcsicmp(argv[i], L"--silent") == 0 ||
+            _wcsicmp(argv[i], L"-silent") == 0 ||
+            _wcsicmp(argv[i], L"/silent") == 0) {
+            silent = TRUE;
+            break;
+        }
+    }
+    LocalFree(argv);
+    return silent;
+}
+
+static wchar_t *current_executable_path(void)
 {
     DWORD capacity = MAX_PATH;
-    wchar_t *command = NULL;
+    wchar_t *path = NULL;
     DWORD length;
 
     for (;;) {
-        wchar_t *larger = (wchar_t *)realloc(command, (capacity + 3) * sizeof(wchar_t));
+        wchar_t *larger = (wchar_t *)realloc(path, capacity * sizeof(wchar_t));
         if (!larger) {
-            free(command);
+            free(path);
             SetLastError(ERROR_OUTOFMEMORY);
             return NULL;
         }
-        command = larger;
-        length = GetModuleFileNameW(NULL, command + 1, capacity);
+        path = larger;
+        length = GetModuleFileNameW(NULL, path, capacity);
         if (length == 0) {
-            free(command);
+            free(path);
             return NULL;
         }
         if (length < capacity) {
             break;
         }
         if (capacity >= 32768) {
-            free(command);
+            free(path);
             SetLastError(ERROR_FILENAME_EXCED_RANGE);
             return NULL;
         }
@@ -303,9 +326,24 @@ static wchar_t *current_startup_command(void)
         if (capacity > 32768) capacity = 32768;
     }
 
-    command[0] = L'"';
-    command[length + 1] = L'"';
-    command[length + 2] = L'\0';
+    return path;
+}
+
+static wchar_t *current_startup_command(void)
+{
+    wchar_t *path = current_executable_path();
+    wchar_t *command;
+    size_t capacity;
+
+    if (!path) return NULL;
+    capacity = wcslen(path) + wcslen(STARTUP_ARGUMENTS) + 4;
+    command = (wchar_t *)malloc(capacity * sizeof(wchar_t));
+    if (command) {
+        _snwprintf(command, capacity, L"\"%ls\" %ls", path, STARTUP_ARGUMENTS);
+    } else {
+        SetLastError(ERROR_OUTOFMEMORY);
+    }
+    free(path);
     return command;
 }
 
@@ -323,7 +361,8 @@ static BOOL is_run_registered(void)
         return FALSE;
     }
     if (RegQueryValueExW(key, STARTUP_VALUE_NAME, NULL, &type, NULL, &bytes) != ERROR_SUCCESS ||
-        type != REG_SZ || bytes == 0 || bytes > 32770 * sizeof(wchar_t)) {
+        type != REG_SZ || bytes == 0 ||
+        bytes > (32768 + wcslen(STARTUP_ARGUMENTS) + 3) * sizeof(wchar_t)) {
         RegCloseKey(key);
         return FALSE;
     }
@@ -382,8 +421,8 @@ static LSTATUS set_run_registered(BOOL enabled)
 /* Register both Explorer startup mechanisms. The mutex prevents duplicate instances. */
 static LSTATUS startup_link(BOOL write, BOOL enabled)
 {
-    wchar_t path[MAX_PATH], target[32768], directory[32768];
-    wchar_t *command = NULL, *slash;
+    wchar_t path[MAX_PATH], target[32768], directory[32768], arguments[64];
+    wchar_t *executable = NULL, *slash;
     IShellLinkW *link = NULL;
     IPersistFile *file = NULL;
     HRESULT init, hr;
@@ -400,15 +439,14 @@ static LSTATUS startup_link(BOOL write, BOOL enabled)
         result = GetLastError();
         return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
     }
-    command = current_startup_command();
-    if (!command) return GetLastError();
-    command[wcslen(command) - 1] = L'\0';
-    wcscpy(directory, command + 1);
+    executable = current_executable_path();
+    if (!executable) return GetLastError();
+    wcscpy(directory, executable);
     slash = wcsrchr(directory, L'\\');
     if (slash) *slash = L'\0';
     init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(init) && init != RPC_E_CHANGED_MODE) {
-        free(command);
+        free(executable);
         return ERROR_GEN_FAILURE;
     }
     hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
@@ -416,20 +454,23 @@ static LSTATUS startup_link(BOOL write, BOOL enabled)
     if (SUCCEEDED(hr))
         hr = IShellLinkW_QueryInterface(link, &IID_IPersistFile, (void **)&file);
     if (SUCCEEDED(hr) && write) {
-        hr = IShellLinkW_SetPath(link, command + 1);
+        hr = IShellLinkW_SetPath(link, executable);
+        if (SUCCEEDED(hr)) hr = IShellLinkW_SetArguments(link, STARTUP_ARGUMENTS);
         if (SUCCEEDED(hr)) hr = IShellLinkW_SetWorkingDirectory(link, directory);
         if (SUCCEEDED(hr)) hr = IPersistFile_Save(file, path, TRUE);
     } else if (SUCCEEDED(hr)) {
         hr = IPersistFile_Load(file, path, STGM_READ);
         if (SUCCEEDED(hr)) hr = IShellLinkW_GetPath(link, target, 32768, NULL, SLGP_RAWPATH);
-        if (SUCCEEDED(hr) && _wcsicmp(target, command + 1) != 0) hr = E_FAIL;
+        if (SUCCEEDED(hr) && _wcsicmp(target, executable) != 0) hr = E_FAIL;
+        if (SUCCEEDED(hr)) hr = IShellLinkW_GetArguments(link, arguments, 64);
+        if (SUCCEEDED(hr) && _wcsicmp(arguments, STARTUP_ARGUMENTS) != 0) hr = E_FAIL;
     }
     if (FAILED(hr)) result = HRESULT_FACILITY(hr) == FACILITY_WIN32
                             ? HRESULT_CODE(hr) : ERROR_GEN_FAILURE;
     if (file) IPersistFile_Release(file);
     if (link) IShellLinkW_Release(link);
     if (SUCCEEDED(init)) CoUninitialize();
-    free(command);
+    free(executable);
     return result;
 }
 
@@ -1223,6 +1264,9 @@ static void add_tray_icon(HWND hwnd)
 
     if (Shell_NotifyIconW(NIM_ADD, &nid)) {
         g_tray_added = TRUE;
+        KillTimer(hwnd, TIMER_TRAY_RETRY);
+    } else {
+        SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, NULL);
     }
 }
 
@@ -1230,6 +1274,8 @@ static void remove_tray_icon(HWND hwnd)
 {
     NOTIFYICONDATAW nid;
 
+    g_tray_requested = FALSE;
+    KillTimer(hwnd, TIMER_TRAY_RETRY);
     if (!g_tray_added) {
         return;
     }
@@ -1306,6 +1352,7 @@ static void show_main_on_cursor_monitor(HWND hwnd)
 
 static void hide_to_tray(HWND hwnd)
 {
+    g_tray_requested = TRUE;
     add_tray_icon(hwnd);
     ShowWindow(hwnd, SW_HIDE);
 }
@@ -1661,7 +1708,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
     }
 
     if (msg == g_taskbar_created_msg) {
-        if (g_tray_added) {
+        if (g_tray_requested) {
             g_tray_added = FALSE;
             add_tray_icon(hwnd);
         }
@@ -1721,6 +1768,8 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
         } else if (wparam == TIMER_DISPLAY_REFRESH) {
             KillTimer(hwnd, TIMER_DISPLAY_REFRESH);
             refresh_display_layout(hwnd);
+        } else if (wparam == TIMER_TRAY_RETRY && g_tray_requested) {
+            add_tray_icon(hwnd);
         }
         return 0;
 
@@ -1847,6 +1896,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
     INITCOMMONCONTROLSEX icc;
     HWND hwnd;
     MSG msg;
+    BOOL silent = has_silent_option();
 
     (void)prev;
     (void)cmdline;
@@ -1856,11 +1906,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
     g_show_existing_msg = RegisterWindowMessageW(SHOW_EXISTING_MESSAGE_NAME);
     g_single_instance_mutex = CreateMutexW(NULL, TRUE, SINGLE_INSTANCE_MUTEX_NAME);
     if (g_single_instance_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        notify_existing_instance();
+        if (!silent) notify_existing_instance();
         close_single_instance_mutex();
         return 0;
     } else if (!g_single_instance_mutex && GetLastError() == ERROR_ACCESS_DENIED) {
-        notify_existing_instance();
+        if (!silent) notify_existing_instance();
         return 0;
     }
 
@@ -1908,8 +1958,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show_cmd)
         return 1;
     }
 
-    ShowWindow(hwnd, SW_SHOWNORMAL);
-    UpdateWindow(hwnd);
+    if (silent) {
+        /* The main window starts hidden; do not let the launcher's show state display it. */
+        g_tray_requested = TRUE;
+        add_tray_icon(hwnd);
+    } else {
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        UpdateWindow(hwnd);
+    }
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
