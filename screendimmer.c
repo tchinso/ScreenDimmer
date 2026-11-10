@@ -24,6 +24,7 @@
 #define ID_TRAY_SHOW 1004
 #define ID_TRAY_EXIT 1005
 #define ID_STARTUP 1006
+#define ID_EDIT_SCHEDULE 1007
 
 #define ID_SLIDER_BASE 2000
 #define ID_BLACKOUT_BASE 3000
@@ -108,7 +109,10 @@ static const ScheduleRule g_default_schedule[] = {
     { 23 * 60 + 59, 1 * 60, 50 },
     { 1 * 60, 2 * 60, 45 },
     { 2 * 60, 6 * 60, 40 },
-    { 6 * 60, 17 * 60, 90 },
+    { 6 * 60, 6 * 60 + 10, 60 },
+    { 6 * 60 + 10, 6 * 60 + 20, 70 },
+    { 6 * 60 + 20, 6 * 60 + 30, 80 },
+    { 6 * 60 + 30, 17 * 60, 90 },
     { 17 * 60, 19 * 60, 70 }
 };
 
@@ -273,6 +277,69 @@ static void resolve_cfg_path(void)
         _snwprintf(g_cfg_path, MAX_PATH, L"%S", CFG_NAME);
     }
     g_cfg_path[MAX_PATH - 1] = L'\0';
+}
+
+static DWORD ensure_cfg_file(void)
+{
+    HANDLE file;
+    DWORD error = ERROR_SUCCESS;
+    size_t i;
+
+    /* CREATE_NEW preserves any existing schedule, including an empty file. */
+    file = CreateFileW(g_cfg_path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                       CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS
+            ? ERROR_SUCCESS : error;
+    }
+
+    for (i = 0; i < sizeof(g_default_schedule) / sizeof(g_default_schedule[0]); i++) {
+        const ScheduleRule *rule = &g_default_schedule[i];
+        char line[64];
+        DWORD written;
+        int length = snprintf(line, sizeof(line), "%02d:%02d-%02d:%02d = %d\r\n",
+                              rule->start_minutes / 60, rule->start_minutes % 60,
+                              rule->end_minutes / 60, rule->end_minutes % 60,
+                              rule->value);
+        if (!WriteFile(file, line, (DWORD)length, &written, NULL)) {
+            error = GetLastError();
+            break;
+        }
+        if (written != (DWORD)length) {
+            error = ERROR_WRITE_FAULT;
+            break;
+        }
+    }
+    if (!CloseHandle(file) && error == ERROR_SUCCESS) error = GetLastError();
+    if (error != ERROR_SUCCESS) DeleteFileW(g_cfg_path);
+    return error;
+}
+
+static void edit_schedule(HWND hwnd)
+{
+    wchar_t arguments[MAX_PATH + 3];
+    wchar_t message[160];
+    DWORD error = ensure_cfg_file();
+    INT_PTR result;
+
+    if (error != ERROR_SUCCESS) {
+        _snwprintf(message, sizeof(message) / sizeof(message[0]),
+                   L"brightness.cfg 파일을 만들지 못했습니다. (오류 %lu)",
+                   (unsigned long)error);
+    } else {
+        /* .cfg files may not have an associated editor on Windows. */
+        _snwprintf(arguments, sizeof(arguments) / sizeof(arguments[0]),
+                   L"\"%ls\"", g_cfg_path);
+        result = (INT_PTR)ShellExecuteW(hwnd, L"open", L"notepad.exe", arguments,
+                                       NULL, SW_SHOWNORMAL);
+        if (result > 32) return;
+        _snwprintf(message, sizeof(message) / sizeof(message[0]),
+                   L"brightness.cfg 파일을 열지 못했습니다. (오류 %ld)",
+                   (long)result);
+    }
+    message[(sizeof(message) / sizeof(message[0])) - 1] = L'\0';
+    MessageBoxW(hwnd, message, utf8_wide("화면 필터 밝기"), MB_OK | MB_ICONERROR);
 }
 
 static BOOL has_silent_option(void)
@@ -1382,6 +1449,11 @@ static void show_tray_menu(HWND hwnd)
 
 static void handle_command(HWND hwnd, int id)
 {
+    if (id == ID_EDIT_SCHEDULE) {
+        edit_schedule(hwnd);
+        return;
+    }
+
     if (id == ID_TOPMOST) {
         BOOL enabled = !g_topmost_enabled;
         g_topmost_enabled = enabled;
@@ -1843,6 +1915,8 @@ static HMENU create_main_menu(void)
                      ID_TOPMOST, utf8_wide("필터를 항상 최상위로 설정")) ||
         !AppendMenuW(settings, MF_STRING | (is_startup_registered() ? MF_CHECKED : 0),
                      ID_STARTUP, utf8_wide("Windows 시작 시 자동 실행")) ||
+        !AppendMenuW(settings, MF_STRING, ID_EDIT_SCHEDULE,
+                     utf8_wide("자동 밝기 스케줄 수정")) ||
         !AppendMenuW(menu, MF_POPUP, (UINT_PTR)settings, utf8_wide("설정"))) {
         DestroyMenu(settings);
         DestroyMenu(menu);
